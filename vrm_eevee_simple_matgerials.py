@@ -80,6 +80,7 @@ def guess_alpha_need(mat, base_img_node):
         return ('NONE', None)
     tree = mat.node_tree
 
+    # First priority: check if the material itself was set to transparent
     try:
         if getattr(mat, "blend_method", "OPAQUE") != "OPAQUE":
             if base_img_node and base_img_node.image:
@@ -87,16 +88,93 @@ def guess_alpha_need(mat, base_img_node):
     except Exception:
         pass
 
+    # Second priority: look for separate alpha/opacity texture nodes
     for n in tree.nodes:
         if _is_image_node(n):
             nm = (n.name or "").lower()
             if ("alpha" in nm) or ("opacity" in nm) or ("transparent" in nm):
                 return ('SEPARATE_IMAGE', n)
 
+    # Third priority: check if base texture has an alpha channel
     if base_img_node and base_img_node.image:
-        return ('FROM_BASE', None)
+        img = base_img_node.image
+        try:
+            # Check if image has alpha channel (RGBA = 4 channels)
+            if getattr(img, "channels", 0) == 4:
+                return ('FROM_BASE', None)
+            # Some images report has_alpha flag
+            if getattr(img, "alpha_mode", None) in {'STRAIGHT', 'PREMUL'}:
+                return ('FROM_BASE', None)
+        except Exception:
+            pass
 
     return ('NONE', None)
+
+def guess_emission_info(mat):
+    """Detect emission color, strength, and texture from the original material.
+    Returns (emission_color, emission_strength, emission_image_node).
+    emission_color is an (R, G, B, A) tuple.
+    """
+    default = ((0, 0, 0, 1), 0.0, None)
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return default
+    tree = mat.node_tree
+
+    # --- Try Principled BSDF first ---
+    principled = _find_principled_node(tree)
+    if principled:
+        # Emission Color input
+        em_color_in = (principled.inputs.get("Emission Color")
+                       or principled.inputs.get("Emission"))
+        em_strength_in = principled.inputs.get("Emission Strength")
+
+        em_color = (0, 0, 0, 1)
+        em_strength = 0.0
+        em_img = None
+
+        if em_color_in is not None:
+            em_color = tuple(em_color_in.default_value)
+            # Check for connected image texture
+            em_img = _find_upstream_image_from_socket(em_color_in)
+
+        if em_strength_in is not None:
+            em_strength = em_strength_in.default_value
+
+        # If no explicit strength but color is non-black, assume strength=1
+        if em_strength == 0.0 and em_color[:3] != (0, 0, 0):
+            em_strength = 1.0
+
+        if em_strength > 0.0 or em_img is not None:
+            return (em_color, em_strength, em_img)
+
+    # --- Try MToon-style group nodes ---
+    emission_keys = ("emission", "_emissioncolor", "emissionfactor", "emissive")
+    for n in tree.nodes:
+        if n.type == 'GROUP' and n.node_tree:
+            for inp in n.inputs:
+                nm = (inp.name or "").lower().replace(" ", "")
+                if any(k in nm for k in emission_keys):
+                    if inp.type == 'RGBA' or inp.type == 'VECTOR':
+                        col = tuple(inp.default_value)
+                        if len(col) == 3:
+                            col = col + (1.0,)
+                        if col[:3] != (0, 0, 0):
+                            img = _find_upstream_image_from_socket(inp)
+                            return (col, 1.0, img)
+
+    # --- Try any Emission shader node ---
+    for n in tree.nodes:
+        if n.type == 'EMISSION':
+            col_in = n.inputs.get("Color")
+            str_in = n.inputs.get("Strength")
+            if col_in is not None:
+                col = tuple(col_in.default_value)
+                strength = str_in.default_value if str_in else 1.0
+                img = _find_upstream_image_from_socket(col_in)
+                if strength > 0.0 and (col[:3] != (0, 0, 0) or img is not None):
+                    return (col, strength, img)
+
+    return default
 
 def copy_uvmap_setting(src_img_node, dst_img_node):
     try:
@@ -126,18 +204,23 @@ def build_eevee_toon_material(
     new_mat,
     base_img_node=None,
     alpha_mode=('NONE', None),
-    alpha_blend_method='HASHED',
+    alpha_blend_method='CLIP',
     alpha_clip_threshold=0.5,
     ramp_center=0.62,
     ramp_softness=0.02,
-    shadow_value=0.25
+    shadow_value=0.25,
+    emission_color=(0, 0, 0, 1),
+    emission_strength=0.0,
+    emission_img_node=None
 ):
     """
-    Basic toon look:
-      BaseColor (Image) * Ramp(LightFactor) -> Emission -> Output
+    GLB-compatible toon material using Principled BSDF:
+      - Base Color: direct texture (for glTF export)
+      - Emission Color: BaseColor * Ramp(LightFactor) + VRM Emission (for Eevee flat toon)
+      - Alpha: texture alpha → Principled BSDF Alpha (for glTF cutout)
 
-    LightFactor:
-      Diffuse(white) -> ShaderToRGB -> RGBtoBW -> ColorRamp (with small transition width)
+    LightFactor (Eevee only):
+      Diffuse(white) -> ShaderToRGB -> RGBtoBW -> ColorRamp (smooth ramp edge)
     """
     new_mat.use_nodes = True
     tree = new_mat.node_tree
@@ -216,25 +299,92 @@ def build_eevee_toon_material(
 
     links.new(ramp.outputs["Color"], mul.inputs["Color2"])
 
-    emit = nodes.new("ShaderNodeEmission")
-    emit.location = (420, 0)
-    links.new(mul.outputs["Color"], emit.inputs["Color"])
-    emit.inputs["Strength"].default_value = 1.0
+    # --- Output via Principled BSDF (GLB/glTF compatible) ---
+    principled_out = nodes.new("ShaderNodeBsdfPrincipled")
+    principled_out.location = (600, 0)
+    principled_out.label = "Toon Output"
 
-    use_alpha = (alpha_mode[0] != 'NONE')
-    if use_alpha:
-        transparent = nodes.new("ShaderNodeBsdfTransparent")
-        transparent.location = (420, -240)
+    # Flat matte look: no metallic, full roughness, no specular
+    principled_out.inputs["Metallic"].default_value = 0.0
+    principled_out.inputs["Roughness"].default_value = 1.0
+    # Specular input name varies by Blender version
+    spec_in = (principled_out.inputs.get("Specular IOR Level")
+               or principled_out.inputs.get("Specular"))
+    if spec_in is not None:
+        spec_in.default_value = 0.0
 
-        mix = nodes.new("ShaderNodeMixShader")
-        mix.location = (650, -60)
+    # Base Color = toon result (texture × ramp)
+    # - Eevee: toon ramp modulates the base → toon-like lighting bands
+    # - GLB: exporter traces through MixRGB to find the Image Texture for baseColorTexture
+    links.new(mul.outputs["Color"], principled_out.inputs["Base Color"])
 
-        links.new(transparent.outputs["BSDF"], mix.inputs[1])
-        links.new(emit.outputs["Emission"], mix.inputs[2])
+    # Emission Color = VRM emission ONLY (NOT toon result)
+    # Direct texture/color connection so the glTF exporter can trace it cleanly
+    emission_input_name = "Emission Color" if principled_out.inputs.get("Emission Color") else "Emission"
+    emission_strength_input = principled_out.inputs.get("Emission Strength")
 
-        if alpha_mode[0] == 'FROM_BASE' and tex is not None and tex.outputs.get("Alpha") is not None:
-            links.new(tex.outputs["Alpha"], mix.inputs["Fac"])
-        elif alpha_mode[0] == 'SEPARATE_IMAGE' and alpha_mode[1] is not None and getattr(alpha_mode[1], "image", None) is not None:
+    has_vrm_emission = (emission_strength > 0.0 or emission_img_node is not None)
+    if has_vrm_emission:
+        if emission_img_node is not None and emission_img_node.image:
+            tex_em = nodes.new("ShaderNodeTexImage")
+            tex_em.location = (-800, 320)
+            tex_em.label = "VRM Emission Tex"
+            tex_em.image = emission_img_node.image
+            tex_em.interpolation = getattr(emission_img_node, "interpolation", 'Linear')
+            tex_em.extension = getattr(emission_img_node, "extension", 'REPEAT')
+            copy_uvmap_setting(emission_img_node, tex_em)
+            try:
+                tex_em.image.colorspace_settings.name = "sRGB"
+            except Exception:
+                pass
+            links.new(tex_em.outputs["Color"], principled_out.inputs[emission_input_name])
+        else:
+            ec = emission_color[:4] if len(emission_color) >= 4 else tuple(emission_color) + (1.0,)
+            principled_out.inputs[emission_input_name].default_value = ec
+
+        if emission_strength_input is not None:
+            emission_strength_input.default_value = max(emission_strength, 1.0)
+    else:
+        # No VRM emission → Emission Strength = 0 (no glow, no white blowout)
+        if emission_strength_input is not None:
+            emission_strength_input.default_value = 0.0
+
+    # --- Alpha handling: build strict MASK chain (0/1) for reliable glTF MASK export ---
+    use_alpha = True
+
+    try:
+        principled_out.inputs["Alpha"].default_value = 1.0
+    except Exception:
+        pass
+
+    try:
+        # Create a BW conversion + Greater Than math node to produce 0/1 mask
+        alpha_bw = nodes.new("ShaderNodeRGBToBW")
+        alpha_bw.location = (-240, 60)
+
+        alpha_thresh = nodes.new("ShaderNodeMath")
+        alpha_thresh.location = (-40, 60)
+        alpha_thresh.operation = 'GREATER_THAN'
+        # Second input is the threshold value
+        try:
+            alpha_thresh.inputs[1].default_value = alpha_clip_threshold
+        except Exception:
+            pass
+
+        connected_alpha = False
+
+        # Prefer explicit alpha output from base texture
+        if alpha_mode[0] == 'FROM_BASE' and tex is not None:
+            if tex.outputs.get("Alpha") is not None:
+                links.new(tex.outputs["Alpha"], alpha_thresh.inputs[0])
+                connected_alpha = True
+            else:
+                links.new(tex.outputs["Color"], alpha_bw.inputs["Color"])
+                links.new(alpha_bw.outputs["Val"], alpha_thresh.inputs[0])
+                connected_alpha = True
+
+        # If separate alpha image is provided, use it
+        if not connected_alpha and alpha_mode[0] == 'SEPARATE_IMAGE' and alpha_mode[1] is not None and getattr(alpha_mode[1], "image", None) is not None:
             a_src = alpha_mode[1]
             tex_a = nodes.new("ShaderNodeTexImage")
             tex_a.location = (-800, -40)
@@ -246,35 +396,35 @@ def build_eevee_toon_material(
                 tex_a.image.colorspace_settings.name = "Non-Color"
             except Exception:
                 pass
+
             if tex_a.outputs.get("Alpha") is not None:
-                links.new(tex_a.outputs["Alpha"], mix.inputs["Fac"])
+                links.new(tex_a.outputs["Alpha"], alpha_thresh.inputs[0])
             else:
-                links.new(tex_a.outputs["Color"], mix.inputs["Fac"])
-        else:
-            mix.inputs["Fac"].default_value = 1.0
+                links.new(tex_a.outputs["Color"], alpha_bw.inputs["Color"])
+                links.new(alpha_bw.outputs["Val"], alpha_thresh.inputs[0])
+            connected_alpha = True
 
-        links.new(mix.outputs["Shader"], out.inputs["Surface"])
+        # Connect threshold output to Principled Alpha if we connected a source
+        if connected_alpha:
+            links.new(alpha_thresh.outputs["Value"], principled_out.inputs["Alpha"])
 
-        # Eevee transparency settings
-        try:
-            new_mat.blend_method = alpha_blend_method
-            new_mat.shadow_method = alpha_blend_method if alpha_blend_method in {'HASHED', 'CLIP'} else 'HASHED'
-            if alpha_blend_method == 'CLIP':
-                new_mat.alpha_threshold = alpha_clip_threshold
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-        try:
-            new_mat.use_backface_culling = False
-        except Exception:
-            pass
-    else:
-        links.new(emit.outputs["Emission"], out.inputs["Surface"])
-        try:
-            new_mat.blend_method = 'OPAQUE'
-            new_mat.shadow_method = 'OPAQUE'
-        except Exception:
-            pass
+    # Force material to use CLIP (MASK) for exporter
+    try:
+        new_mat.blend_method = 'CLIP'
+        new_mat.shadow_method = 'CLIP'
+        new_mat.alpha_threshold = alpha_clip_threshold
+    except Exception:
+        pass
+
+    try:
+        new_mat.use_backface_culling = False
+    except Exception:
+        pass
+
+    links.new(principled_out.outputs["BSDF"], out.inputs["Surface"])
 
     return use_alpha
 
@@ -347,6 +497,7 @@ def convert_object_materials(
 
         base_img = guess_basecolor_image_node(old)
         alpha_mode = guess_alpha_need(old, base_img)
+        em_color, em_strength, em_img = guess_emission_info(old)
 
         build_eevee_toon_material(
             new,
@@ -356,8 +507,20 @@ def convert_object_materials(
             alpha_clip_threshold=alpha_clip_threshold,
             ramp_center=ramp_center,
             ramp_softness=ramp_softness,
-            shadow_value=shadow_value
+            shadow_value=shadow_value,
+            emission_color=em_color,
+            emission_strength=em_strength,
+            emission_img_node=em_img
         )
+
+        # Ensure exporter-relevant material flags are forced to MASK/CLIP
+        try:
+            new.blend_method = 'CLIP'
+            new.shadow_method = 'CLIP'
+            new.alpha_threshold = alpha_clip_threshold
+            new.use_backface_culling = False
+        except Exception:
+            pass
 
         cache_map[old] = new
         slot.material = new
@@ -391,11 +554,11 @@ class VRM_OT_replace_with_eevee_toon(bpy.types.Operator):
     alpha_blend_method: EnumProperty(
         name="Transparency Mode (Eevee)",
         items=[
+            ('CLIP', "Alpha Clip (GLB cutout)", ""),
             ('HASHED', "Alpha Hashed (hair/eyelashes)", ""),
-            ('CLIP', "Alpha Clip (crisp cutout)", ""),
             ('BLEND', "Alpha Blend (semi-transparent)", ""),
         ],
-        default='HASHED'
+        default='CLIP'
     )
     alpha_clip_threshold: FloatProperty(
         name="Clip Threshold",
@@ -546,8 +709,8 @@ def register():
 
     bpy.types.Scene.vrm_toon_alpha_mode = EnumProperty(
         name="Transparency Mode",
-        items=[('HASHED', "Alpha Hashed", ""), ('CLIP', "Alpha Clip", ""), ('BLEND', "Alpha Blend", "")],
-        default='HASHED'
+        items=[('CLIP', "Alpha Clip (GLB cutout)", ""), ('HASHED', "Alpha Hashed", ""), ('BLEND', "Alpha Blend", "")],
+        default='CLIP'
     )
     bpy.types.Scene.vrm_toon_alpha_clip_threshold = FloatProperty(name="Clip Threshold", default=0.5, min=0.0, max=1.0)
 
